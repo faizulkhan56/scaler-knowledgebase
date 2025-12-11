@@ -1,0 +1,335 @@
+services:
+  # All services for StarRocks (Frontend, Backend)
+  starrocks-fe:
+    image: starrocks/fe-ubuntu:3.4.0
+    hostname: starrocks-fe
+    container_name: starrocks-fe
+    command:
+      - /bin/bash
+      - -c
+      - |
+        echo "expr_children_limit = 45000" >> /opt/starrocks/fe/conf/fe.conf
+        /opt/starrocks/fe_entrypoint.sh starrocks-fe
+    environment:
+      - HOST_TYPE=FQDN
+      - TZ=UTC
+      - GTZ=UTC
+    ports:
+      - "8030:8030"
+      - "9020:9020"
+      - "9030:9030"
+    volumes:
+      - data_starrocks_fe_meta:/opt/starrocks/fe/meta
+    healthcheck:
+      test: bash -c "exec 6<> /dev/tcp/localhost/9030"
+    networks:
+      - scalar-network
+    restart: unless-stopped
+
+  starrocks-be:
+    image: starrocks/be-ubuntu:3.4.0
+    hostname: starrocks-be
+    container_name: starrocks-be
+    command:
+      - /bin/bash
+      - -c
+      - |
+        /opt/starrocks/be_entrypoint.sh starrocks-fe
+    environment:
+      - HOST_TYPE=FQDN
+      - TZ=UTC
+      - GTZ=UTC
+    ports:
+      - "8040:8040"
+    healthcheck:
+      test: bash -c "exec 6<> /dev/tcp/localhost/8040"
+    depends_on:
+      starrocks-fe:
+        condition: service_healthy
+    volumes:
+      - data_starrocks_be_storage:/opt/starrocks/be/storage
+    networks:
+      - scalar-network
+    restart: unless-stopped
+
+  # Pulsar Services
+
+  zookeeper:
+    image: apachepulsar/pulsar:${PULSAR_VERSION:-4.0.5}
+    platform: ${DOCKER_PLATFORM:-linux/amd64}
+    container_name: pulsar-zookeeper
+    restart: unless-stopped
+    networks:
+      - scalar-network
+    volumes:
+      - pulsar_data_zookeeper:/data/zookeeper
+    environment:
+      - metadataStoreUrl=zk:zookeeper:2181
+      - PULSAR_MEM=${PULSAR_ZK_JVM_MEM:--Xms512m -Xmx768m -XX:MaxDirectMemorySize=256m}
+      - tickTime=2000
+      - initLimit=10
+      - syncLimit=5
+      - maxSessionTimeout=${PULSAR_ZK_SESSION_TIMEOUT:-60000}
+    command:
+      - bash
+      - -c
+      - |
+        bin/apply-config-from-env.py conf/zookeeper.conf && \
+        bin/generate-zookeeper-config.sh conf/zookeeper.conf && \
+        exec bin/pulsar zookeeper
+    healthcheck:
+      test: ["CMD", "bin/pulsar-zookeeper-ruok.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    deploy:
+      resources:
+        reservations:
+          memory: ${PULSAR_ZK_MEM_RESERVATION:-256M}
+        limits:
+          cpus: ${PULSAR_ZK_CPU_LIMIT:-1.0}
+          memory: ${PULSAR_ZK_MEM_LIMIT:-1G}
+
+  pulsar-init:
+    container_name: pulsar-init
+    hostname: pulsar-init
+    image: apachepulsar/pulsar:${PULSAR_VERSION:-4.0.5}
+    platform: ${DOCKER_PLATFORM:-linux/amd64}
+    networks:
+      - scalar-network
+    environment:
+      - PULSAR_MEM=-Xms128m -Xmx256m
+    command:
+      - bash
+      - -c
+      - |
+        bin/pulsar initialize-cluster-metadata \
+        --cluster cluster-a \
+        --zookeeper zookeeper:2181 \
+        --configuration-store zookeeper:2181 \
+        --web-service-url http://broker:8080 \
+        --broker-service-url pulsar://broker:6650
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+
+  bookie:
+    image: apachepulsar/pulsar:${PULSAR_VERSION:-4.0.5}
+    platform: ${DOCKER_PLATFORM:-linux/amd64}
+    container_name: pulsar-bookie
+    restart: unless-stopped
+    networks:
+      - scalar-network
+    environment:
+      - clusterName=cluster-a
+      - zkServers=zookeeper:2181
+      - metadataServiceUri=metadata-store:zk:zookeeper:2181
+      - advertisedAddress=bookie
+      - PULSAR_MEM=${PULSAR_BOOKIE_JVM_MEM:--Xms1g -Xmx1536m -XX:MaxDirectMemorySize=512m}
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+      pulsar-init:
+        condition: service_completed_successfully
+    volumes:
+      - pulsar_data_bookkeeper:/data/bookkeeper
+    command: bash -c "bin/apply-config-from-env.py conf/bookkeeper.conf && exec bin/pulsar bookie"
+    healthcheck:
+      test: ["CMD", "bin/bookkeeper", "shell", "bookiesanity"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    deploy:
+      resources:
+        reservations:
+          memory: ${PULSAR_BOOKIE_MEM_RESERVATION:-512M}
+        limits:
+          cpus: ${PULSAR_BOOKIE_CPU_LIMIT:-1.0}
+          memory: ${PULSAR_BOOKIE_MEM_LIMIT:-2G}
+
+  broker:
+    image: apachepulsar/pulsar:${PULSAR_VERSION:-4.0.5}
+    platform: ${DOCKER_PLATFORM:-linux/amd64}
+    container_name: pulsar-broker
+    hostname: pulsar-broker
+    restart: unless-stopped
+    networks:
+      - scalar-network
+    environment:
+      - metadataStoreUrl=zk:zookeeper:2181
+      - zookeeperServers=zookeeper:2181
+      - clusterName=cluster-a
+      - managedLedgerDefaultEnsembleSize=1
+      - managedLedgerDefaultWriteQuorum=1
+      - managedLedgerDefaultAckQuorum=1
+      - advertisedAddress=broker
+      - advertisedListeners=internal:pulsar://pulsar-broker:6650,external:pulsar://127.0.0.1:6650
+      - PULSAR_MEM=${PULSAR_BROKER_JVM_MEM:--Xms1g -Xmx1536m -XX:MaxDirectMemorySize=512m}
+      - maxMessageSize=${PULSAR_MAX_MESSAGE_SIZE:-10485760}
+      - zooKeeperSessionTimeoutMillis=${PULSAR_ZK_SESSION_TIMEOUT:-60000}
+      # Batch acknowledgement support - enables more efficient message acknowledgement
+      - acknowledgmentAtBatchIndexLevelEnabled=true
+      # Note: ackTimeout is a client-side setting in Pulsar. Since DotPulsar 3.3.0 doesn't
+      # expose this configuration, we rely on optimized message processing and the default 30s timeout.
+      # If timeouts persist, consider increasing DatabaseConnectionThrottler from 25 to 50 concurrent operations.
+
+    healthcheck:
+      test:
+        ["CMD", "curl", "-f", "http://localhost:8080/admin/v2/brokers/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+      bookie:
+        condition: service_healthy
+    ports:
+      - "6650:6650"
+      - "8080:8080"
+    command: bash -c "bin/apply-config-from-env.py conf/broker.conf && exec bin/pulsar broker"
+    deploy:
+      resources:
+        reservations:
+          memory: ${PULSAR_BROKER_MEM_RESERVATION:-512M}
+        limits:
+          cpus: ${PULSAR_BROKER_CPU_LIMIT:-1.0}
+          memory: ${PULSAR_BROKER_MEM_LIMIT:-2G}
+
+  redis:
+    image: redis/redis-stack:7.4.0-v0
+    container_name: scalar-redis
+    volumes:
+      - data_redis:/data
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+    networks:
+      - scalar-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    depends_on:
+      starrocks-fe:
+        condition: service_healthy
+      broker:
+        condition: service_healthy
+
+  acquisition:
+    image: acquisition
+    container_name: scalar-acquisition
+    environment:
+      - Otlp__Endpoint=http://otel-lgtm:4317
+      - OTEL_METRIC_EXPORT_INTERVAL=5000
+      - SERVICE_NAME=scalar-acquisition
+      - ASPNETCORE_ENVIRONMENT=Development
+      - DOTNET_ENVIRONMENT=Development
+      - APP_RUNNING_LOCALLY=false
+      - DB_OPERATION_TYPE=LocalPasswordlessRoot
+      - AZURE_TENANT_ID=${AZURE_TENANT_ID}
+      - AZURE_CLIENT_ID=${AZURE_CLIENT_ID}
+      - AZURE_CLIENT_SECRET=${AZURE_CLIENT_SECRET}
+    build:
+      context: .
+      dockerfile: Acquisition/Dockerfile
+    restart: unless-stopped
+    stop_grace_period: 30s
+    ports:
+      - "7001:8080"
+    networks:
+      - scalar-network
+    depends_on:
+      starrocks-fe:
+        condition: service_healthy
+      broker:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  ingestion:
+    image: ingestion
+    container_name: scalar-ingestion
+    environment:
+      - Otlp__Endpoint=http://otel-lgtm:4317
+      - OTEL_METRIC_EXPORT_INTERVAL=5000
+      - SERVICE_NAME=scalar-ingestion
+      - ASPNETCORE_ENVIRONMENT=Development
+      - DOTNET_ENVIRONMENT=Development
+      - APP_RUNNING_LOCALLY=false
+      - DB_OPERATION_TYPE=LocalPasswordlessRoot
+      - AZURE_TENANT_ID=${AZURE_TENANT_ID}
+      - AZURE_CLIENT_ID=${AZURE_CLIENT_ID}
+      - AZURE_CLIENT_SECRET=${AZURE_CLIENT_SECRET}
+    build:
+      context: .
+      dockerfile: Ingestion/Dockerfile
+    restart: unless-stopped
+    stop_grace_period: 30s
+    ports:
+      - "7002:8080"
+    networks:
+      - scalar-network
+    depends_on:
+      starrocks-fe:
+        condition: service_healthy
+      broker:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  otel-lgtm:
+    image: grafana/otel-lgtm
+    container_name: otel-lgtm
+    volumes:
+      - data_monitoring:/data # use dedicated disk in prod
+    restart: unless-stopped
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+      - LOKI_RETENTION_PERIOD=48h
+      - MIMIR_RETENTION_PERIOD=720h
+      - TEMPO_RETENTION_PERIOD=720h
+    ports:
+      - 3000:3000
+      - 4317:4317
+      - 4318:4318
+    networks:
+      - scalar-network
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: otel-collector
+    #    command: ["--config=/etc/otelcol/config.yaml"]
+    user: "0"
+    group_add:
+      - "998"
+    volumes:
+      - /:/hostfs:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./otelcol-config.yaml:/etc/otelcol/config.yaml:ro
+    networks:
+      - scalar-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          memory: 512M
+        limits:
+          cpus: "1.00"
+          memory: 1G
+
+networks:
+  scalar-network:
+    driver: bridge
+
+volumes:
+  data_starrocks_fe_meta: # local-development
+  data_starrocks_be_storage: # local-development
+  pulsar_data_zookeeper: # local-development -> multi service pulsar (initializer, zookeeper, bookie/bookkeeper, broker)
+  pulsar_data_bookkeeper: # local-development -> multi service pulsar (initializer, zookeeper, bookie/bookkeeper, broker)
+  data_redis: # local-development
+  data_monitoring: # local-development
